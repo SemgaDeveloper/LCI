@@ -3,6 +3,22 @@
 /* --------------------------------------------------------------- */
 const PacketWriter = require("../../packetwriter");
 
+// neoLegacy switched every entity id on the wire from a short to an int
+// ("chore: switch all entity ids to dedicated ints"), and also changed
+// SetEntityMotionPacket to [bool useBytes][int id][...]. Writing the old
+// short-id layouts desynchronises the packet stream: the client reads the
+// next field as part of the id, ends up with a bogus entity type in
+// AddMobPacket and dereferences a null LivingEntity in
+// ClientConnection::handleAddMob (crash at +0x167, write to 0x1b0).
+
+// LCE EntityIO ids that resolve to a LivingEntity. Sending anything else in
+// an AddMobPacket makes EntityIO::newById() return null and
+// handleAddMob()'s dynamic_pointer_cast<LivingEntity> then dereferences it.
+const LCE_LIVING_ENTITY_TYPES = new Set([
+  50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+  90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 107, 120,
+]);
+
 function sendAddMobPacket(proxy, client, entityInfo) {
   try {
     if (
@@ -21,6 +37,20 @@ function sendAddMobPacket(proxy, client, entityInfo) {
       client._sentEntities = new Set();
     }
     client._sentEntities.add(entityKey);
+
+    if (!LCE_LIVING_ENTITY_TYPES.has(entityInfo.type)) {
+      if (!proxy._unsupportedMobWarnings) {
+        proxy._unsupportedMobWarnings = new Set();
+      }
+      const warningKey = `${entityInfo.javaType || "unknown"}/${entityInfo.type}`;
+      if (!proxy._unsupportedMobWarnings.has(warningKey)) {
+        proxy._unsupportedMobWarnings.add(warningKey);
+        console.log(
+          `[LCE] not spawning unsupported mob: ${entityInfo.javaType || "unknown"} (LCE type ${entityInfo.type})`,
+        );
+      }
+      return;
+    }
 
     if (
       !Number.isFinite(entityInfo.x) ||
@@ -43,7 +73,7 @@ function sendAddMobPacket(proxy, client, entityInfo) {
     }
 
     const writer = new PacketWriter();
-    writer.writeShort(entityInfo.entityId & 0xffff);
+    writer.writeInt(entityInfo.entityId);
     writer.writeByte(entityInfo.type & 0xff);
 
     writer.writeInt(posX);
@@ -173,7 +203,7 @@ function sendAddEntityPacket(proxy, client, entityInfo) {
     }
 
     const writer = new PacketWriter();
-    writer.writeShort(entityInfo.entityId & 0xffff);
+    writer.writeInt(entityInfo.entityId);
     writer.writeByte(entityInfo.type & 0xff);
 
     writer.writeInt(posX);
@@ -239,7 +269,7 @@ function sendMoveEntityPacketForEntity(
 ) {
   if (Math.abs(dX) <= 127 && Math.abs(dY) <= 127 && Math.abs(dZ) <= 127) {
     const writer = new PacketWriter();
-    writer.writeShort(entity.entityId);
+    writer.writeInt(entity.entityId);
     writer.writeByte(dX & 0xff);
     writer.writeByte(dY & 0xff);
     writer.writeByte(dZ & 0xff);
@@ -278,7 +308,7 @@ function sendMoveEntityPacketForEntity(
 
 function sendTeleportEntityPacketForEntity(proxy, client, entity) {
   const writer = new PacketWriter();
-  writer.writeShort(entity.entityId);
+  writer.writeInt(entity.entityId);
 
   writer.writeInt(Math.floor(entity.x * 32));
   writer.writeInt(Math.floor(entity.y * 32));
@@ -294,7 +324,7 @@ function sendTeleportEntityPacketForEntity(proxy, client, entity) {
 
 function sendRotateEntityPacketForEntity(proxy, client, entity) {
   const writer = new PacketWriter();
-  writer.writeShort(entity.entityId);
+  writer.writeInt(entity.entityId);
 
   const prevYaw = entity.prevYaw !== undefined ? entity.prevYaw : entity.yaw;
   const prevPitch =
@@ -401,9 +431,10 @@ function sendSetEntityMotionPacket(proxy, client, entity) {
     return;
   }
 
-  let xa = entity.velocityX || 0;
-  let ya = entity.velocityY || 0;
-  let za = entity.velocityZ || 0;
+  // velocityX/Y/Z are stored in blocks per tick; the packet uses 1/8000 units.
+  let xa = Math.floor((entity.velocityX || 0) * 8000);
+  let ya = Math.floor((entity.velocityY || 0) * 8000);
+  let za = Math.floor((entity.velocityZ || 0) * 8000);
 
   const maxVel = 31200;
   xa = Math.max(-maxVel, Math.min(maxVel, xa));
@@ -413,6 +444,8 @@ function sendSetEntityMotionPacket(proxy, client, entity) {
   const writer = new PacketWriter();
 
   try {
+    // Current format (see SetEntityMotionPacket::read):
+    //   bool useBytes, int id, then 3 signed bytes (*16) or 3 shorts.
     const useBytes =
       xa >= -2048 &&
       xa < 2048 &&
@@ -420,20 +453,17 @@ function sendSetEntityMotionPacket(proxy, client, entity) {
       ya < 2048 &&
       za >= -2048 &&
       za < 2048;
+
+    writer.writeBoolean(useBytes);
+    writer.writeInt(entity.entityId);
+
     if (useBytes) {
-      writer.writeShort((entity.entityId & 0x07ff) | 0x800);
-
-      const xByte = Math.floor(xa / 16);
-      const yByte = Math.floor(ya / 16);
-      const zByte = Math.floor(za / 16);
-
-      writer.writeSignedByte(xByte);
-      writer.writeSignedByte(yByte);
-      writer.writeSignedByte(zByte);
+      writer.writeSignedByte(Math.floor(xa / 16));
+      writer.writeSignedByte(Math.floor(ya / 16));
+      writer.writeSignedByte(Math.floor(za / 16));
     } else {
-      writer.writeShort(entity.entityId & 0x07ff);
-
       writer.writeShort(xa);
+
       writer.writeShort(ya);
       writer.writeShort(za);
     }

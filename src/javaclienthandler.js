@@ -77,6 +77,36 @@ async function connectToJavaServer(proxy, client) {
   client.javaClient = javaClient;
   client._lastJavaPackets = [];
 
+  if (process.env.LCE_DEBUG === "1") {
+    const interesting = new Set([
+      "position",
+      "position_look",
+      "look",
+      "use_entity",
+      "chat",
+      "entity_action",
+      "arm_animation",
+      "held_item_slot",
+      "player_command",
+      "block_place",
+      "block_dig",
+      "custom_payload",
+    ]);
+    const originalWrite = javaClient.write.bind(javaClient);
+    javaClient.write = (name, params) => {
+      if (interesting.has(name)) {
+        let detail = "";
+        try {
+          detail = " " + JSON.stringify(params);
+        } catch (err) {
+          /* do nothing */
+        }
+        console.log(`[JAVA->] ${name}${detail}`);
+      }
+      return originalWrite(name, params);
+    };
+  }
+
   const returnToLobby = (message) => {
     if (client.socket && client.socket.destroyed) return;
     const old = client.javaClient;
@@ -531,35 +561,50 @@ async function connectToJavaServer(proxy, client) {
         client.loadedChunks.clear();
       }
 
+      const entityIdsToRemove = new Set();
+
       if (client.javaPlayers) {
         for (const [uuid, player] of client.javaPlayers) {
           player.spawned = false;
+          player.readyToSpawn = false;
+          if (player.entityId) {
+            entityIdsToRemove.add(player.entityId);
+          }
         }
       }
 
       if (client.javaEntities) {
-        const entityIdsToRemove = [];
         for (const [javaEntityId, entity] of client.javaEntities) {
-          if (entity.lceEntityId) {
-            entityIdsToRemove.push(entity.lceEntityId);
-          }
-        }
-
-        if (entityIdsToRemove.length > 0) {
-          const maxPerPacket = 255;
-          for (let i = 0; i < entityIdsToRemove.length; i += maxPerPacket) {
-            const batch = entityIdsToRemove.slice(i, i + maxPerPacket);
-            const removeWriter = new PacketWriter();
-            removeWriter.writeByte(batch.length);
-            for (const id of batch) {
-              removeWriter.writeInt(id);
-            }
-            proxy.sendPacket(client, 0x1d, removeWriter.toBuffer());
+          // Entities are keyed by Java id and store the LCE id in entityId.
+          if (entity.entityId) {
+            entityIdsToRemove.add(entity.entityId);
           }
         }
 
         client.javaEntities.clear();
       }
+
+      const idsToRemove = Array.from(entityIdsToRemove);
+      if (idsToRemove.length > 0) {
+        const maxPerPacket = 255;
+        for (let i = 0; i < idsToRemove.length; i += maxPerPacket) {
+          const batch = idsToRemove.slice(i, i + maxPerPacket);
+          const removeWriter = new PacketWriter();
+          removeWriter.writeByte(batch.length);
+          for (const id of batch) {
+            removeWriter.writeInt(id);
+          }
+          proxy.sendPacket(client, 0x1d, removeWriter.toBuffer());
+        }
+      }
+
+      // Java reuses entity ids after a dimension change/respawn, so stale
+      // dead/destroyed markers would otherwise block attacks on respawned
+      // entities (handleInteract drops every attack for destroyed ids).
+      if (client._deadEntities) client._deadEntities.clear();
+      if (client._destroyedEntities) client._destroyedEntities.clear();
+      if (client._lastAttacks) client._lastAttacks.clear();
+      if (client._dyingPlayers) client._dyingPlayers.clear();
 
       const respawnWriter = new PacketWriter();
       respawnWriter.writeByte(packet.dimension & 0xff);
@@ -572,7 +617,7 @@ async function connectToJavaServer(proxy, client) {
       respawnWriter.writeLong(0); //mapSeed
       respawnWriter.writeByte(packet.difficulty || client.javaDifficulty || 1); //difficulty
       respawnWriter.writeBoolean(false); //newSeaLevel
-      respawnWriter.writeShort(0); //newEntityId
+      respawnWriter.writeInt(0); //newEntityId
       respawnWriter.writeShort(864); //xzSize
       respawnWriter.writeByte(8); //hellScale
       proxy.sendPacket(client, 0x09, respawnWriter.toBuffer());
@@ -760,41 +805,22 @@ async function connectToJavaServer(proxy, client) {
         if (packet.data && packet.data.length > 0) {
           for (const playerData of packet.data) {
             const uuid = playerData.UUID || playerData.uuid;
-            if (uuid && client.javaPlayers.has(uuid)) {
-              const player = client.javaPlayers.get(uuid);
-              if (player.spawned) {
-                player.isNPC = true;
-                continue;
-              }
-              if (player.spawned && player.entityId) {
-                const isDying =
-                  client._dyingPlayers &&
-                  client._dyingPlayers.has(player.javaEntityId);
+            if (!uuid || !client.javaPlayers.has(uuid)) continue;
 
-                if (!isDying) {
-                  const removeWriter = new PacketWriter();
-                  removeWriter.writeByte(1);
-                  removeWriter.writeInt(player.entityId);
-                  proxy.sendPacket(client, 0x1d, removeWriter.toBuffer());
-                  client.javaPlayers.delete(uuid);
-                } else {
-                  setTimeout(() => {
-                    if (client.javaPlayers.has(uuid)) {
-                      const removeWriter = new PacketWriter();
-                      removeWriter.writeByte(1);
-                      removeWriter.writeInt(player.entityId);
-                      proxy.sendPacket(client, 0x1d, removeWriter.toBuffer());
-                      client.javaPlayers.delete(uuid);
-                    }
-                    if (client._dyingPlayers) {
-                      client._dyingPlayers.delete(player.javaEntityId);
-                    }
-                  }, 1500);
-                }
-              } else {
-                client.javaPlayers.delete(uuid);
-              }
+            const player = client.javaPlayers.get(uuid);
+
+            // Servers commonly drop a player from the tab list while the
+            // entity is still in the world (spectators, NPC plugins), so a
+            // spawned entity is removed only when entity_destroy arrives.
+            if (player.spawned && player.entityId) {
+              player.inTabList = false;
+              continue;
             }
+
+            if (player.javaEntityId && client.javaToLceEntityId) {
+              client.javaToLceEntityId.delete(player.javaEntityId);
+            }
+            client.javaPlayers.delete(uuid);
           }
         }
       }
@@ -867,6 +893,12 @@ async function connectToJavaServer(proxy, client) {
       playerInfo.z = packet.z / 32;
       playerInfo.yaw = (packet.yaw / 256) * 360;
       playerInfo.pitch = (packet.pitch / 256) * 360;
+
+      if (process.env.LCE_DEBUG === "1") {
+        console.log(
+          `[LCE] player ${playerInfo.name}: java ${packet.entityId} -> lce ${playerInfo.entityId} @ ${playerInfo.x.toFixed(2)},${playerInfo.y.toFixed(2)},${playerInfo.z.toFixed(2)}`,
+        );
+      }
 
       if (playerInfo.name && playerInfo.name !== "Player") {
         if (playerInfo.spawned) {
@@ -971,6 +1003,27 @@ async function connectToJavaServer(proxy, client) {
     }
   });
 
+  // LCE has no resource pack support, but 1.8 servers (minigame networks in
+  // particular) send one on join and some of them gate the join sequence on
+  // the client acknowledging it. A vanilla client replies with 3 (accepted)
+  // and then 0 (successfully loaded). Acknowledge immediately: the pack itself
+  // is unused by the LCE client, but not answering makes those servers stall
+  // or kick during join.
+  javaClient.on("resource_pack_send", (packet) => {
+    try {
+      javaClient.write("resource_pack_receive", {
+        hash: packet.hash || "",
+        result: 3,
+      });
+      javaClient.write("resource_pack_receive", {
+        hash: packet.hash || "",
+        result: 0,
+      });
+    } catch (err) {
+      /* do nothing */
+    }
+  });
+
   javaClient.on("close_window", (packet) => {
     if (client.state === "play") {
       if (
@@ -1001,13 +1054,40 @@ async function connectToJavaServer(proxy, client) {
     }
   });
 
+  // Transaction packets (S32 -> C0F) are the server's ping/pong mechanism.
+  // The server sends a window id and (usually random) action number, and a
+  // vanilla 1.8 client answers with accepted = true and the *same* action
+  // number. They are also used to confirm container clicks.
+  //
+  // The LCE client only implements half of this handshake ("accepted = false"
+  // -> re-ack) and does it on the game thread, so during login/chunk load the
+  // reply can arrive after a server's anti-bot timeout. Translating the packet
+  // through both protocols also made it possible for the server to receive a
+  // pong for an action number it did not send, which anti-cheats report as
+  // "Unexpected pong response ... window: 0".
+  //
+  // Answer here exactly like a vanilla client instead: only reply when the
+  // server marks the transaction as not accepted, echoing the action number.
+  // The LCE client has no other use for this packet, so do not forward it.
   javaClient.on("transaction", (packet) => {
-    if (client.state === "play") {
-      const writer = new PacketWriter();
-      writer.writeByte(packet.windowId & 0xff);
-      writer.writeShort(packet.action);
-      writer.writeBoolean(packet.accepted);
-      proxy.sendPacket(client, 0x6a, writer.toBuffer());
+    // Mirror vanilla: only confirm transactions for the player's inventory
+    // (window 0) or the container that is actually open. Replying to any other
+    // window is what anti-cheats call an "unexpected pong response".
+    const knownWindow =
+      packet.windowId === 0 || packet.windowId === client.openWindowId;
+
+    if (packet.accepted || !knownWindow) {
+      return;
+    }
+
+    try {
+      javaClient.write("transaction", {
+        windowId: packet.windowId,
+        action: packet.action,
+        accepted: true,
+      });
+    } catch (err) {
+      /* do nothing */
     }
   });
 

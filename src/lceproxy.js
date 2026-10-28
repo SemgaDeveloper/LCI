@@ -658,12 +658,24 @@ class LCEProxy {
     writer.writeInt(0); //texturePackId
 
     this.sendPacket(client, 0x02, writer.toBuffer());
-    if (client._netcodeVersion >= 561) {
-      client.authState = "waitingResponse";
-      setImmediate(() => this._sendAuthSchemePacket(client));
-    } else {
-      client.authState = "done";
-    }
+
+    // Do not send the 0xAA/0xAC auth-scheme handshake here.
+    //
+    // The neoLegacy / legacy_evolved client (build 571) has no mapping for
+    // packet IDs 0xAA or 0xAC in Packet::staticCtor(). Packet::readPacket()
+    // consumes only the ID byte and returns nullptr for an unknown packet,
+    // leaving that packet's payload in the stream. The next read then starts
+    // in the middle of the payload, desynchronising the whole connection.
+    //
+    // That desync is what produced:
+    //   "SECURITY: readUtf received string length 52 exceeding max 20"
+    // followed by the bogus ContainerClosePacket and the null
+    // MultiplayerLocalPlayer crash.
+    //
+    // This client authenticates with the normal LoginPacket instead, and
+    // /lce link still performs Microsoft auth proxy-side, so skip the
+    // unsupported handshake and let handleLogin() proceed.
+    client.authState = "done";
   }
 
   _sendAuthSchemePacket(client) {
@@ -1151,7 +1163,7 @@ class LCEProxy {
 
   sendTeleportEntityPacket(client, playerInfo) {
     const writer = new PacketWriter();
-    writer.writeShort(playerInfo.entityId);
+    writer.writeInt(playerInfo.entityId);
 
     //pos
     writer.writeInt(Math.floor(playerInfo.x * 32));
@@ -1199,6 +1211,9 @@ class LCEProxy {
       64: "WitherBoss",
       65: "Bat",
       66: "Witch",
+      67: "Endermite",
+      68: "Guardian",
+      30: "ArmorStand",
       90: "Pig",
       91: "Sheep",
       92: "Cow",
@@ -1212,7 +1227,6 @@ class LCEProxy {
       99: "VillagerGolem",
       100: "EntityHorse",
       120: "Villager",
-      71: "ItemFrame",
     };
     return typeMap[typeId] || "Unknown";
   }
@@ -1676,6 +1690,18 @@ class LCEProxy {
     const targetId = reader.readInt();
     const action = reader.readByte();
 
+    console.log(
+      `[LCE] interact action=${action} source=${sourceId} target=${targetId}`,
+    );
+
+    const drop = (reason) => {
+      if (action === 1) {
+        console.log(
+          `[LCE] attack dropped: ${reason} (lce target ${targetId})`,
+        );
+      }
+    };
+
     if (action === 0) {
       const heldSlot = client.heldSlot || 0;
       const heldItem = client.inventory
@@ -1720,39 +1746,32 @@ class LCEProxy {
     }
 
     if (client._destroyedEntities && client._destroyedEntities.has(targetId)) {
+      drop("entity already destroyed");
       return;
-    }
-
-    if (action === 1) {
-      const now = Date.now();
-      if (!client._lastAttacks) client._lastAttacks = new Map();
-
-      const lastAttackTime = client._lastAttacks.get(targetId) || 0;
-      if (now - lastAttackTime < 500) {
-        return;
-      }
-      client._lastAttacks.set(targetId, now);
-
-      if (client._lastAttacks.size > 100) {
-        const oldestEntry = Array.from(client._lastAttacks.entries()).sort(
-          (a, b) => a[1] - b[1],
-        )[0];
-        client._lastAttacks.delete(oldestEntry[0]);
-      }
     }
 
     const targetEntity = Array.from(client.javaEntities.values()).find(
       (e) => e.entityId === targetId,
     );
-    const entityType = targetEntity
+    let entityType = targetEntity
       ? `${targetEntity.javaType}(${targetEntity.type})`
       : "UNKNOWN";
+
+    if (!targetEntity) {
+      for (const player of client.javaPlayers.values()) {
+        if (player.entityId === targetId && player.spawned) {
+          entityType = `player:${player.name}`;
+          break;
+        }
+      }
+    }
 
     let targetJavaId = -1;
 
     for (const [javaId, entity] of client.javaEntities) {
       if (entity.entityId === targetId) {
         if (client._deadEntities && client._deadEntities.has(javaId)) {
+          drop(`dead ${entityType}`);
           return;
         }
         targetJavaId = javaId;
@@ -1764,6 +1783,35 @@ class LCEProxy {
       if (player.entityId === targetId && player.spawned) {
         targetJavaId = player.javaEntityId;
         break;
+      }
+    }
+
+    // Fallback: the LCE id may still be in the persistent Java<->LCE map even
+    // if the entity's current LCE id was reassigned. Resolve backwards but
+    // only accept mappings whose Java entity actually exists.
+    if (targetJavaId === -1 && client.javaToLceEntityId) {
+      for (const [javaId, lceId] of client.javaToLceEntityId) {
+        if (lceId !== targetId) continue;
+
+        let exists = client.javaEntities.has(javaId);
+        if (!exists) {
+          for (const player of client.javaPlayers.values()) {
+            if (player.javaEntityId === javaId && player.spawned) {
+              exists = true;
+              break;
+            }
+          }
+        }
+
+        if (exists) {
+          targetJavaId = javaId;
+          if (action === 1) {
+            console.log(
+              `[LCE] attack resolved via id map: lce ${targetId} -> java ${javaId}`,
+            );
+          }
+          break;
+        }
       }
     }
 
@@ -1779,40 +1827,47 @@ class LCEProxy {
       }
 
       if (!entityExists) {
+        drop(`no Java entity for ${entityType}`);
         return;
       }
 
       if (action === 1) {
-        if (!client._pendingAttacks) client._pendingAttacks = new Set();
+        // Vanilla forwards every attack click; only guard against the client
+        // sending the exact same attack twice in a single tick.
+        const now = Date.now();
+        if (!client._lastAttacks) client._lastAttacks = new Map();
 
-        if (client._pendingAttacks.has(targetJavaId)) {
+        const lastAttackTime = client._lastAttacks.get(targetJavaId) || 0;
+        if (now - lastAttackTime < 25) {
           return;
         }
+        client._lastAttacks.set(targetJavaId, now);
 
-        client._pendingAttacks.add(targetJavaId);
+        if (client._lastAttacks.size > 100) {
+          const oldestEntry = Array.from(client._lastAttacks.entries()).sort(
+            (a, b) => a[1] - b[1],
+          )[0];
+          client._lastAttacks.delete(oldestEntry[0]);
+        }
 
-        setTimeout(() => {
-          if (client._pendingAttacks) {
-            client._pendingAttacks.delete(targetJavaId);
-          }
-        }, 150);
+        console.log(
+          `[LCE] attack -> Java entity ${targetJavaId} (lce ${targetId}, ${entityType})`,
+        );
 
         client.javaClient.write("use_entity", {
           target: targetJavaId,
           mouse: 1,
-          sneaking: false,
+          sneaking: !!client.isSneaking,
         });
       } else {
         client.javaClient.write("use_entity", {
           target: targetJavaId,
           mouse: 0,
-          sneaking: false,
+          sneaking: !!client.isSneaking,
         });
       }
     } else {
-      const allEntities = Array.from(client.javaEntities.values()).map(
-        (e) => `LCE:${e.entityId}=Java:${e.javaEntityId}(${e.javaType})`,
-      );
+      drop(`no LCE->Java mapping for ${entityType}`);
     }
   }
 
@@ -1822,75 +1877,16 @@ class LCEProxy {
       const entityId = reader.readInt();
       const action = reader.readByte();
 
+      // AnimatePacket::SWING is only an arm swing. The actual attack is sent
+      // separately by the LCE client as InteractPacket::ATTACK and is handled
+      // in handleInteract(). Synthesising a use_entity attack here from a
+      // 10-block raycast produced hits through walls and well beyond vanilla
+      // reach (~4.5 blocks), which is exactly what server anti-cheats flag as
+      // suspicious activity. Keep the swing, drop the fake attack.
       if (client.javaClient && action === 1) {
         client.javaClient.write("arm_animation", {
           hand: 0,
         });
-
-        const targetEntity = this.raycastEntity(client);
-        if (targetEntity) {
-          const heldSlot = client.heldSlot || 0;
-          const heldItem = client.inventory
-            ? client.inventory[36 + heldSlot]
-            : null;
-          const heldItemId = heldItem ? heldItem.blockId : -1;
-
-          const useItems = [
-            346, //fishing rod
-            261, //bow
-          ];
-
-          if (useItems.includes(heldItemId)) {
-            return;
-          }
-          const entity = client.javaEntities.get(targetEntity);
-          let isPlayer = false;
-
-          if (!entity) {
-            for (const [uuid, player] of client.javaPlayers) {
-              if (player.javaEntityId === targetEntity && player.spawned) {
-                isPlayer = true;
-                break;
-              }
-            }
-
-            if (!isPlayer) {
-              return;
-            }
-          } else {
-            if (!entity.spawnTime) {
-              return;
-            }
-
-            const now = Date.now();
-            const timeSinceSpawn = now - entity.spawnTime;
-            if (timeSinceSpawn < 500) {
-              return;
-            }
-          }
-
-          if (client._deadEntities && client._deadEntities.has(targetEntity)) {
-            return;
-          }
-
-          if (!client._pendingAttacks) client._pendingAttacks = new Set();
-          if (client._pendingAttacks.has(targetEntity)) {
-            return;
-          }
-
-          client._pendingAttacks.add(targetEntity);
-          setTimeout(() => {
-            if (client._pendingAttacks) {
-              client._pendingAttacks.delete(targetEntity);
-            }
-          }, 150);
-
-          client.javaClient.write("use_entity", {
-            target: targetEntity,
-            mouse: 1,
-            sneaking: false,
-          });
-        }
       }
     } catch (err) {
       /* do nothing */
@@ -1898,15 +1894,19 @@ class LCEProxy {
   }
 
   raycastEntity(client) {
-    if (!client.playerX || !client.playerYaw || !client.playerPitch) {
+    if (
+      !Number.isFinite(client.playerX) ||
+      !Number.isFinite(client.playerY) ||
+      !Number.isFinite(client.playerZ)
+    ) {
       return null;
     }
 
     const playerX = client.playerX;
     const playerY = client.playerY + 1.62; //eye height
     const playerZ = client.playerZ;
-    const yaw = client.playerYaw;
-    const pitch = client.playerPitch;
+    const yaw = client.playerYaw || 0;
+    const pitch = client.playerPitch || 0;
 
     const yawRad = ((yaw + 90) * Math.PI) / 180;
     const pitchRad = (pitch * Math.PI) / 180;
@@ -1915,8 +1915,8 @@ class LCEProxy {
     const dirY = -Math.sin(pitchRad);
     const dirZ = Math.cos(pitchRad) * Math.sin(yawRad);
 
-    //max hit distance
-    const maxDistance = 10.0;
+    // Vanilla 1.8 entity reach: 4.5 blocks in survival, 5.0 in creative.
+    const maxDistance = client.javaGameMode === 1 ? 5.0 : 4.5;
     let closestEntity = null;
     let closestDistance = maxDistance;
 
@@ -2004,6 +2004,40 @@ class LCEProxy {
         xRot = client.lastPitch || 0;
       }
       onGround = reader.readByte();
+
+      // While riding, the LCE client sends its vehicle-move packet with
+      // y/yView = -999. That is not a player position; forwarding it would
+      // move the Java player to y = -999 and instantly trip anti-cheat.
+      if (y === -999 && yView === -999) {
+        const ridingYaw = normalizeYaw(yRot);
+        client.playerYaw = ridingYaw;
+        client.playerPitch = xRot;
+        client.lastYaw = ridingYaw;
+        client.lastPitch = xRot;
+
+        if (client.javaClient && client.javaClient.write) {
+          try {
+            client.javaClient.write("look", {
+              yaw: ridingYaw,
+              pitch: xRot,
+              onGround: (onGround & 0x1) !== 0,
+            });
+          } catch (err) {
+            /* do nothing */
+          }
+        }
+        return;
+      }
+
+      if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        !Number.isFinite(z) ||
+        Math.abs(x) > 32000000 ||
+        Math.abs(z) > 32000000
+      ) {
+        return;
+      }
     } else if (dataSize >= 9) {
       yRot = reader.readFloat();
       xRot = reader.readFloat();
@@ -2036,7 +2070,7 @@ class LCEProxy {
           z: z,
           yaw: normalizedYaw,
           pitch: xRot,
-          onGround: onGround !== 0,
+          onGround: (onGround & 0x1) !== 0,
         });
       } catch (err) {
         /* do nothing */
@@ -2174,8 +2208,21 @@ class LCEProxy {
                 itemDamage: useItemAux || 0,
               };
 
+              // LCE repeats UseItemPacket while the button is held. Java only
+              // needs one use-item packet per action; forwarding every repeat
+              // looks like packet spam to anti-cheats (and re-triggers eating,
+              // potions, etc.). Throttle per item.
+              if (!client._itemUseState) client._itemUseState = {};
+              const now = Date.now();
+              const lastUse = client._itemUseState[javaItemId] || 0;
+              if (now - lastUse < 150) {
+                return;
+              }
+              client._itemUseState[javaItemId] = now;
+
               try {
                 const blockPlacePacket = {
+                  // Vanilla sends y = -1, encoded as unsigned 255.
                   location: { x: -1, y: 255, z: -1 },
                   direction: -1,
                   heldItem: heldItem,
@@ -2452,7 +2499,9 @@ class LCEProxy {
     } else if (action === 3 || action === 4) {
       if (client.javaClient && client.javaClient.write) {
         try {
-          const javaStatus = action === 4 ? 4 : 3;
+          // LCE: 3 = DROP_ALL_ITEMS, 4 = DROP_ITEM.
+          // Java: 3 = DROP_ITEM, 4 = DROP_ALL_ITEMS.
+          const javaStatus = action === 3 ? 4 : 3;
           const packet = {
             status: javaStatus,
             location: { x: 0, y: 0, z: 0 },
@@ -2499,30 +2548,6 @@ class LCEProxy {
     }
   }
 
-  handlePlayerInput(client, data) {
-    const reader = new PacketReader(data.slice(1));
-    const xxa = reader.readFloat();
-    const yya = reader.readFloat();
-    const isJumping = reader.readBoolean();
-    const isSneaking = reader.readBoolean();
-
-    client.isSneaking = isSneaking;
-
-    //broken
-    if (isSneaking && client.javaClient && client.javaClient.write) {
-      try {
-        client.javaClient.write("steer_vehicle", {
-          sideways: 0,
-          forward: 0,
-          jump: false,
-          unmount: true,
-        });
-      } catch (err) {
-        /* do nothing */
-      }
-    }
-  }
-
   handlePlayerCommand(client, data) {
     const reader = new PacketReader(data.slice(1));
     const entityId = reader.readInt();
@@ -2535,6 +2560,7 @@ class LCEProxy {
 
         if (action === 1) {
           javaAction = 0;
+          client.isSneaking = true;
           if (client.isRiding) {
             client.javaClient.write("steer_vehicle", {
               sideways: 0,
@@ -2545,12 +2571,15 @@ class LCEProxy {
           }
         } else if (action === 2) {
           javaAction = 1; //java: STOP_SNEAKING
+          client.isSneaking = false;
         } else if (action === 3) {
           javaAction = 2; //java: LEAVE_BED
         } else if (action === 4) {
           javaAction = 3; //java: START_SPRINTING
+          client.isSprinting = true;
         } else if (action === 5) {
           javaAction = 4; //java: STOP_SPRINTING
+          client.isSprinting = false;
         } else if (action === 8) {
           javaAction = 5; //java: RIDING_JUMP (open horse inventory)
         } else if (action === 9) {
@@ -2558,8 +2587,12 @@ class LCEProxy {
         }
 
         if (javaAction !== -1) {
+          // The Java server ignores entity_action unless entityId is the
+          // player's own Java entity id. Sending the LCE id here meant
+          // sprint/sneak were silently dropped, so anti-cheats saw a player
+          // moving at sprint speed without ever starting to sprint.
           client.javaClient.write("entity_action", {
-            entityId: entityId,
+            entityId: client.javaPlayerEntityId ?? entityId,
             actionId: javaAction,
             jumpBoost: actionData || 0,
           });
@@ -2576,6 +2609,9 @@ class LCEProxy {
     const yya = reader.readFloat();
     const isJumping = reader.readBoolean();
     const isSneaking = reader.readBoolean();
+
+    client.isSneaking = isSneaking;
+    client.isJumping = isJumping;
 
     if (client.javaClient && client.javaClient.write) {
       try {
@@ -3653,22 +3689,14 @@ class LCEProxy {
   }
 
   handleContainerAck(client, data) {
-    const reader = new PacketReader(data.slice(1));
-    const windowId = reader.readByte();
-    const action = reader.readShort();
-    const accepted = reader.readBoolean();
-
-    if (client.javaClient && client.javaClient.write) {
-      try {
-        client.javaClient.write("transaction", {
-          windowId: windowId,
-          action: action,
-          accepted: accepted,
-        });
-      } catch (err) {
-        /* do nothing */
-      }
-    }
+    // The LCE client only ever sends this packet as an automatic reply to a
+    // ContainerAckPacket from the proxy (it does not originate one itself),
+    // and Java transactions are now answered directly by the Java client
+    // handler. Forwarding these replies would put a transaction on the Java
+    // wire for a window/action number the server never asked about, which
+    // anti-cheats surface as "Unexpected pong response". The only 0x6a still
+    // sent to the client is the book GUI reject below, whose reply is
+    // deliberately swallowed here.
   }
 
   handleContainerClick(client, data) {
@@ -3893,6 +3921,17 @@ class LCEProxy {
         z = reader.readDouble();
         onGround = reader.readByte();
 
+        if (
+          y === -999 ||
+          !Number.isFinite(x) ||
+          !Number.isFinite(y) ||
+          !Number.isFinite(z) ||
+          Math.abs(x) > 32000000 ||
+          Math.abs(z) > 32000000
+        ) {
+          return;
+        }
+
         client.playerX = x;
         client.playerY = y;
         client.playerZ = z;
@@ -3905,7 +3944,7 @@ class LCEProxy {
               z: z,
               yaw: client.lastYaw || 0,
               pitch: client.lastPitch || 0,
-              onGround: onGround !== 0,
+              onGround: (onGround & 0x1) !== 0,
             });
           } catch (err) {
             /* do nothing */
@@ -3934,7 +3973,7 @@ class LCEProxy {
             client.javaClient.write("look", {
               yaw: normalizedYaw,
               pitch: xRot,
-              onGround: onGround !== 0,
+              onGround: (onGround & 0x1) !== 0,
             });
           } catch (err) {
             /* do nothing */

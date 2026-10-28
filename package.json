@@ -2,9 +2,9 @@
   "name": "lce-proxy",
   "version": "1.0.0",
   "description": "Minecraft Legacy Console Edition LAN Proxy",
-  "main": "proxy.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node proxy.js"
+    "start": "node index.js"
   },
   "keywords": [
     "minecraft",
@@ -13,9 +13,9 @@
     "lan"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "dependencies": {
-    "minecraft-protocol": "^1.64.0",
+    "minecraft-protocol": "^1.68.0",
     "pngjs": "^7.0.0",
     "prismarine-auth": "^2.7.0"
   }

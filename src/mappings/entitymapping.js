@@ -21,13 +21,16 @@ function createEntityTypeMapping() {
     WitherBoss: 64,
     Bat: 65,
     Witch: 66,
+    Endermite: 67,
+    Guardian: 68,
+    ArmorStand: 102,
 
     //animals
     Pig: 90,
     Sheep: 91,
     Cow: 92,
     Chicken: 93,
-    Rabbit: 93,
+    Rabbit: 101,
     Squid: 94,
     Wolf: 95,
     MushroomCow: 96,
